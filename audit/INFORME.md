@@ -146,6 +146,23 @@ Verificación ejecutable: **`audit/repro/02_arbitrary_call_lever.sh`** (imprime 
 
 ---
 
+## 4bis. Segunda pasada (ronda de búsqueda intensiva)
+
+Tras el primer informe se re-auditaron vectores no cubiertos. **Todo descartado**, con el motivo concreto:
+
+| Vector nuevo revisado | Dónde | Por qué no es crítico |
+|---|---|---|
+| **Falsificación de depósitos EVM** (¿el observador confía en la dirección del emisor?) | `zetaclient/chains/evm/observer/inbound.go:257-272`, `v2_inbound.go:136` | `fetchLogs` filtra por `Addresses: {gateway, erc20Custody, connector}` **y** cada parser llama `common.ValidateEvmTxLog(&log, addrEsperada, "", topic)` (comprueba `log.Address` + topic0). Un evento `Deposited` de un contrato impostor se descarta. **Cerrado.** |
+| **Acuñación vía `ZRC20.deposit()`** (la única función que acuña, llamable por `SYSTEM_CONTRACT_ADDRESS` y `gatewayAddress`) | `ZRC20.sol:249-256`, `SystemContract.sol:76-92`, `GatewayZEVM.sol:473-495` | `SystemContract.depositAndCall` es `onlyFungible`; `GatewayZEVM.deposit/depositAndCall` son `onlyProtocol` y `validateTarget` prohíbe `PROTOCOL_ADDRESS` y el propio Gateway. El módulo fungible sólo los invoca desde `HandleEVMDeposit` con `amount` = importe observado. **No hay acuñación sin depósito.** |
+| **Contabilidad ZETA (`AbortedZetaAmount`)** | `x/crosschain/keeper/{cctx,zeta_accounting,msg_server_refund_aborted_tx}.go` | `updateZetaAccounting` es **acumulador puro**: no se consulta como invariante en ningún punto que bloquee movimientos, y `RemoveZetaAbortedAmount` sólo lo decrementa en el refund autorizado. No habilita acuñación ni doble gasto. **Inerte.** |
+| **Bug del rate limiter TSS** (`be79663d`, "ratelimiting race condition vuln", 2025-08-08) — **no está en `v36.0.6`** | `zetaclient/tss/ratelimit/ratelimit.go` | Es un contador de concurrencia local del zetaclient (`pending`/semáforo) para limitar claves TSS en paralelo; el propio PR admite que los tests pasan sin el fix ("improving robustness rather than fixing vulnerabilities"). No da acceso a firmas ni a fondos. **No explotable como robo.** |
+| **`ZCNode-228` / Alpha-Rays / TSSHOCK** (rama `chore/verify-zcnode228-attack-script`, script `e2e/scripts/verify_zcnode228.go`) | `tss-lib` `crypto/mta/proofs.go`, commit `a4af30e`/`9a516a34` | Atacar MtA exige **ser participante del keygen/firma TSS** (nodo de la red o colusión con nodos) ⇒ camino privilegiado, excluido por el encargo. Nota de estado: mainnet v36.0.5 y anteriores pinnean `tss-lib 2e6b438bd901` (2024-09, **sin** el endurecimiento); `v36.0.6` y `zetaclient_v37.0.12+` sí lo llevan. |
+| **Replay de firmas TSS en el Gateway de Solana** (hash de mensaje sin campos) | `protocol-contracts-solana` `v5.0.0` `validate_message_hash.rs`, `instructions/execute.rs` | El hash **sí** incluye `program_id || instruction_id || chain_id || nonce || amount || destination_program || destination_program_pda || sender || data`, y `verify_and_update_nonce` incrementa el nonce on-chain ⇒ no hay replay. `v7` añade `remaining_accounts` al hash (endurecimiento, no agujero vivo). |
+| **`refundStrandedFunds` en `ERC20Custody`** (commit más reciente de main, 2026-11-03) | `68e25bf` | `onlyRole(DEFAULT_ADMIN_ROLE)` ⇒ privilegiado. Descartado por regla explícita. |
+| **Validación de eventos ZRC20/V1 en el nodo** | `x/crosschain/keeper/evm_hooks.go:76-240`, `ParseZRC20WithdrawalEvent` | El nombre de ZRC20 está whitelisteado, pero `ParseZRC20WithdrawalEvent` **no comprueba `log.Address` contra la dirección del ZRC20**; se apoya en `ProcessLogs`, que sí filtra por emisor (`onlyEmitBySystemContract`/`emittingAddress` del SystemContract). Defensa en un solo punto, no hallazgo explotable por sí mismo. |
+| **Refund/abort y logs anidados** (`ProcessLogs` dentro de `HandleEVMDeposit`/`ProcessAbort`) | `evm_deposit.go:145-160`, `abort.go:63-100` | Los CCTX anidados se crean en `tmpCtx` y sólo se confirman si todo el camino tiene éxito; un fallo revierte y no persiste. Sin acumulación de saldo a favor del atacante. |
+| **Buffer de eventos (`prevEventsLen`) en precompiles** | `precompiles/common/balance_handler.go` | Los cambios de saldo se derivan de eventos bancarios reales del mismo `ctx`; falsificar un evento exigiría ejecutar transferencias reales. |
+
 ## 4. Otras líneas revisadas y descartadas (con el motivo)
 
 | Línea | Estado | Motivo de descarte |
@@ -195,4 +212,11 @@ for t in v36.0.4 v36.0.6; do
 
 ## 6. Conclusión
 
-**No crítico live.** El único bypass de autorización real y sin permisos encontrado —la ruta `GatewayZEVM.call()` → CCTX `NoAssetCall` con `IsArbitraryCall` → `MessageContext{Sender: 0x0}` firmado por zetaclient v36 → `GatewayEVM._executeArbitraryCall`— está confirmado en código y en bytecode desplegado, pero **no permite apropiarse de fondos de terceros** (el Gateway no custodia ni mantiene allowances, y el importe de la llamada es del atacante) y, además, el contrato que el repo declara activo hoy revierte esa ruta. Queda como **hallazgo de severidad alta por defensa en profundidad** con tres deudas abiertas verificables: (i) ZetaClient mainnet v36 sin el guard de cancelación; (ii) `develop` de `protocol-contracts-evm` conservando la rama arbitraria mientras `main` la elimina; (iii) implementaciones vivas (`0x9D7aD582…`, `0x38Bfe581…`, `0xb8afbcaf…`) sin artefacto de despliegue reproducible en el repo, lo que impide atribuirlas a un commit.
+**No crítico live (confirmado en dos rondas).** El único bypass de autorización real y sin permisos encontrado —la ruta `GatewayZEVM.call()` → CCTX `NoAssetCall` con `IsArbitraryCall` → `MessageContext{Sender: 0x0}` firmado por zetaclient v36 → `GatewayEVM._executeArbitraryCall`— está confirmado en código y en bytecode desplegado, pero **no permite apropiarse de fondos de terceros** (el Gateway no custodia ni mantiene allowances, y el importe de la llamada es del atacante) y, además, el contrato que el repo declara activo hoy revierte esa ruta. Queda como **hallazgo de severidad alta por defensa en profundidad** con tres deudas abiertas verificables: (i) ZetaClient mainnet v36 sin el guard de cancelación; (ii) `develop` de `protocol-contracts-evm` conservando la rama arbitraria mientras `main` la elimina; (iii) implementaciones vivas (`0x9D7aD582…`, `0x38Bfe581…`, `0xb8afbcaf…`) sin artefacto de despliegue reproducible en el repo, lo que impide atribuirlas a un commit.
+
+
+---
+
+## 7. Nota sobre la segunda ronda
+
+La búsqueda se amplió con los vectores de §4bis: origen de logs del observador (EVM, BTC, Solana, Sui, TON), acuñación vía `ZRC20.deposit`/`SystemContract`, contabilidad `AbortedZetaAmount`, rate limiter TSS (`be79663d`, ausente en v36.0.6), MtA/TSSHOCK, replay de firmas en Solana, `refundStrandedFunds` y los logs anidados de abort/refund. **Ninguno produce fondos de terceros sin privilegios.** El veredicto se mantiene: **no crítico live**, con el bypass de arbitrary-call como el hallazgo real de mayor severidad (alta, defensa en profundidad).
